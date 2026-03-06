@@ -45,7 +45,7 @@ def _get_valid_hash():
         return st.secrets["auth"]["password_hash"]
     except (KeyError, FileNotFoundError):
         # Fallback: hash dari "TelkomselEnterprise2025"
-        return hashlib.sha256("TelkomselEnterprise2025".encode()).hexdigest()
+        return hashlib.sha256("TelkomselEnterprise2025ebpm".encode()).hexdigest()
 
 def check_password():
     """Return True kalau user sudah login dengan password benar."""
