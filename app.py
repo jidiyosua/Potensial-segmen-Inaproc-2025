@@ -14,7 +14,7 @@ import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
-import textwrap, os, io
+import textwrap, os, io, hashlib
 from datetime import datetime
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -22,6 +22,82 @@ from openpyxl.utils import get_column_letter
 # ═══════════════════════════════════════════════════════════════════════════
 st.set_page_config(page_title="Top 20 SI Channel — Telkomsel Enterprise",
                    page_icon="📊", layout="wide", initial_sidebar_state="expanded")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PASSWORD AUTHENTICATION
+# ═══════════════════════════════════════════════════════════════════════════
+# Ganti hash di bawah ini dengan hash password Anda.
+# Cara generate hash baru:
+#   python -c "import hashlib; print(hashlib.sha256('PASSWORD_ANDA'.encode()).hexdigest())"
+#
+# Default password: "TelkomselEnterprise2025ebpm"
+VALID_HASH = "a1c00b3b2b63da0489e7b9c347cbb3bba2a2d15ae55faborz7b1c6f0e3e8d9f2"  # placeholder
+
+def _hash(pw):
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+# ── Gunakan st.secrets kalau ada, fallback ke hardcoded ──
+# Untuk production, buat file .streamlit/secrets.toml:
+#   [auth]
+#   password_hash = "sha256_hash_anda"
+def _get_valid_hash():
+    try:
+        return st.secrets["auth"]["password_hash"]
+    except (KeyError, FileNotFoundError):
+        # Fallback: hash dari "TelkomselEnterprise2025"
+        return hashlib.sha256("TelkomselEnterprise2025".encode()).hexdigest()
+
+def check_password():
+    """Return True kalau user sudah login dengan password benar."""
+    if st.session_state.get("authenticated"):
+        return True
+
+    # ── Login Form ──
+    st.markdown("""
+    <style>
+        .login-box { max-width:440px; margin:80px auto; background:#FFF;
+                     border-radius:20px; padding:48px 40px; text-align:center;
+                     box-shadow:0 8px 40px rgba(0,0,0,0.08);
+                     border-top:5px solid #ED1C24; }
+        .login-box h2 { color:#111!important; font-size:22px!important;
+                        font-weight:800!important; margin:16px 0 4px!important; }
+        .login-box p  { color:#888!important; font-size:13px!important; margin:0 0 24px!important; }
+        .login-logo   { font-size:48px; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="login-box">
+        <div class="login-logo">🔒</div>
+        <h2>Telkomsel Enterprise</h2>
+        <p>Dashboard Top 20 SI Channel Potensial<br>Masukkan password untuk melanjutkan</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Invisible spacer agar input muncul di tengah
+    col_l, col_m, col_r = st.columns([1, 2, 1])
+    with col_m:
+        password = st.text_input("Password", type="password", key="login_pw",
+                                 placeholder="Masukkan password...")
+        login_btn = st.button("🔐 Masuk", use_container_width=True, type="primary")
+
+        if login_btn:
+            if _hash(password) == _get_valid_hash():
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("❌ Password salah. Silakan coba lagi.")
+
+        st.markdown("<div style='text-align:center;margin-top:20px;'>"
+                    "<span style='color:#BBB;font-size:11px;'>"
+                    "Bid Management — Data Science | 2025</span></div>",
+                    unsafe_allow_html=True)
+
+    return False
+
+# ── Cek auth dulu, stop kalau belum login ──
+if not check_password():
+    st.stop()
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CSS
@@ -146,9 +222,7 @@ import re
 
 def _safe_sheet_name(name):
     """Sanitize string agar bisa dipakai sebagai Excel sheet title."""
-    # Hapus karakter ilegal:  * ? / \ [ ] :
     name = re.sub(r'[\*\?/\\\[\]:]', '', name)
-    # Sheet name max 31 karakter
     return name[:31].strip() or "Data"
 
 def to_excel_styled(df, sheet_name="Data"):
@@ -196,7 +270,6 @@ def to_excel_styled(df, sheet_name="Data"):
 # ═══════════════════════════════════════════════════════════════════════════
 def build_si_summary(df_pri_seg, df_det_seg):
     """Build enriched SI summary with instansi & satker info from detail."""
-    # Aggregate from prioritas
     agg_pri = (df_pri_seg.groupby("Nama_Pemenang")
                .agg(Total_Dealing=("Total_Dealing_Rp","sum"),
                     Jumlah_Kontrak=("Jumlah_Kontrak","sum"),
@@ -204,7 +277,6 @@ def build_si_summary(df_pri_seg, df_det_seg):
                     Sektor_List=("Sektor", lambda x: ", ".join(sorted(x.unique()))))
                .reset_index())
 
-    # Aggregate from detail
     if len(df_det_seg) > 0:
         agg_det = (df_det_seg.groupby("Nama_Pemenang")
                    .agg(Jml_Paket_Detail=("Pagu_Rp","count"),
@@ -226,7 +298,6 @@ def build_si_summary(df_pri_seg, df_det_seg):
             merged[c] = 0 if "Jml" in c or "Total" in c else ""
 
     merged = merged.sort_values("Total_Dealing", ascending=False)
-    # Fill NaN
     for c in ["Jml_Instansi","Jml_Satker","Jml_Paket_Detail","Total_Pagu"]:
         if c in merged.columns:
             merged[c] = merged[c].fillna(0).astype(int)
@@ -254,7 +325,6 @@ def chart_top20(df_summary, title, subtitle, accent_color, semesta=None, figsize
     fig.patch.set_facecolor("#FAFAFA")
     ax.set_facecolor("#FAFAFA")
 
-    # Gradient palette
     base = accent_color.lstrip('#')
     r0,g0,b0 = int(base[:2],16), int(base[2:4],16), int(base[4:6],16)
     palette = []
@@ -271,10 +341,8 @@ def chart_top20(df_summary, title, subtitle, accent_color, semesta=None, figsize
     for i, (_, row) in enumerate(d.iterrows()):
         y = n - 1 - i
         val = row["Total_Dealing"]
-        # Line 1: Value + %
         pct = f"  ({val/semesta*100:.1f}%)" if semesta and semesta > 0 else ""
         line1 = f"{fmt_rp(val)}{pct}"
-        # Line 2: Kontrak | Instansi | Satker
         parts = []
         if "Jumlah_Kontrak" in row.index and row["Jumlah_Kontrak"] > 0:
             parts.append(f"{int(row['Jumlah_Kontrak'])} kontrak")
@@ -381,7 +449,6 @@ def render_si_cards(df_summary, df_det_seg, seg_name, key_prefix):
         n_pkt  = int(row.get("Jml_Paket_Detail", 0))
         val    = row["Total_Dealing"]
 
-        # Header line
         header = (f"**#{idx+1} {si}** — {fmt_rp(val)} | "
                   f"{n_inst} instansi • {n_satk} satker • {n_pkt} paket")
 
@@ -390,7 +457,6 @@ def render_si_cards(df_summary, df_det_seg, seg_name, key_prefix):
                 st.caption("Detail paket tidak tersedia untuk SI ini.")
                 continue
 
-            # ── Mini KPI row ──
             k1,k2,k3,k4 = st.columns(4)
             k1.markdown(kpi("Total Pagu", fmt_rp(dsi["Pagu_Rp"].sum())), unsafe_allow_html=True)
             k2.markdown(kpi("Jumlah Paket", fmt_n(len(dsi))), unsafe_allow_html=True)
@@ -401,7 +467,6 @@ def render_si_cards(df_summary, df_det_seg, seg_name, key_prefix):
 
             st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
-            # ── Instansi breakdown ──
             col_a, col_b = st.columns(2)
             with col_a:
                 st.markdown("**🏛️ Instansi Pembeli yang Dilayani:**")
@@ -421,7 +486,6 @@ def render_si_cards(df_summary, df_det_seg, seg_name, key_prefix):
                 satk_agg.columns = ["Satuan Kerja", "Total Pagu", "Jml Paket"]
                 st.dataframe(satk_agg, use_container_width=True, hide_index=True, height=220)
 
-            # ── Semua paket ──
             st.markdown("**📋 Daftar Paket:**")
             cols_show = ["Nama_Paket","Pagu_Rp","Instansi_Pembeli","Satuan_Kerja",
                          "Lokasi","Metode_Pemilihan","Sektor","Kategori_ICT"]
@@ -432,7 +496,6 @@ def render_si_cards(df_summary, df_det_seg, seg_name, key_prefix):
                 df_paket["Pagu_Rp"] = df_paket["Pagu_Rp"].apply(fmt_rp)
             st.dataframe(df_paket, use_container_width=True, hide_index=True, height=250)
 
-            # ── Download per SI ──
             excel_si = to_excel_styled(dsi[cols_avail] if cols_avail else dsi, f"Paket_{si[:20]}")
             _fn_si = re.sub(r'[^\w\s-]', '', si[:25]).replace(' ', '_')
             st.download_button(
@@ -459,7 +522,6 @@ def render_segment(df_pri_seg, df_det_seg, seg_name, color, key_pf, semesta_pri=
     total_det = len(df_det_seg)
     total_pagu = df_det_seg["Pagu_Rp"].sum() if total_det > 0 else 0
 
-    # ── KPIs ──
     c1,c2,c3,c4,c5,c6 = st.columns(6)
     c1.markdown(kpi("SI Channel", fmt_n(n_si)), unsafe_allow_html=True)
     c2.markdown(kpi("Total Dealing", fmt_rp(total_val)), unsafe_allow_html=True)
@@ -475,14 +537,12 @@ def render_segment(df_pri_seg, df_det_seg, seg_name, color, key_pf, semesta_pri=
 
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
 
-    # ── TOP 20 CHART (ALL) ──
     fig = chart_top20(summary, f"Top {min(20,n_si)} SI Channel — {seg_name}",
                       f"Nilai dealing + jumlah instansi & satuan kerja yang dilayani",
                       color, semesta_pri or total_val)
     st.pyplot(fig, use_container_width=True)
     plt.close(fig)
 
-    # ── Download Excel Top 20 summary ──
     dl_summary = summary.head(20).copy()
     dl_cols = ["Nama_Pemenang","Total_Dealing","Jumlah_Kontrak","Max_Klien",
                "Jml_Instansi","Jml_Satker","Jml_Paket_Detail","Total_Pagu",
@@ -498,7 +558,6 @@ def render_segment(df_pri_seg, df_det_seg, seg_name, color, key_pf, semesta_pri=
 
     st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
-    # ── TABS: ICT / Non-ICT / Detail Cards ──
     t_all, t_ict, t_non, t_inst = st.tabs(
         ["📊 Detail per SI", "💻 Top 20 ICT", "📦 Top 20 Non-ICT", "🏛️ Top Instansi & Satker"])
 
@@ -551,7 +610,6 @@ def render_segment(df_pri_seg, df_det_seg, seg_name, color, key_pf, semesta_pri=
 
     with t_inst:
         if len(df_det_seg) > 0:
-            # Top 15 instansi
             st.markdown(f"**🏛️ Top 15 Instansi Pembeli — {seg_name}**")
             inst_top = (df_det_seg.groupby("Instansi_Pembeli")
                         .agg(Total=("Pagu_Rp","sum"), Paket=("Pagu_Rp","count"),
@@ -579,7 +637,6 @@ def render_segment(df_pri_seg, df_det_seg, seg_name, color, key_pf, semesta_pri=
 
             st.markdown(f"<div style='height:16px'></div>", unsafe_allow_html=True)
 
-            # Top 15 satker
             st.markdown(f"**🏢 Top 15 Satuan Kerja — {seg_name}**")
             satk_top = (df_det_seg.groupby("Satuan_Kerja")
                         .agg(Total=("Pagu_Rp","sum"), Paket=("Pagu_Rp","count"),
@@ -659,7 +716,6 @@ def load_all():
     dd = pd.read_excel(f2)
     dc = pd.read_csv(f3)
 
-    # Uncensor
     um = {}
     for _,r in dc.iterrows():
         n = str(r.get("Nama_Pemenang","")).strip()
@@ -712,6 +768,12 @@ with st.sidebar:
     st.markdown("---")
     sektor = st.radio("🔍 Sektor", ["Semua","ICT","Non-ICT"], index=0)
     st.markdown("---")
+
+    # ── Logout button ──
+    if st.button("🚪 Logout", use_container_width=True):
+        st.session_state["authenticated"] = False
+        st.rerun()
+
     st.caption(f"Telkomsel Enterprise\n{datetime.now():%d %B %Y}")
 
 # FILTER
@@ -727,7 +789,6 @@ if sektor != "Semua":
 # ═══════════════════════════════════════════════════════════════════════════
 if "Overview" in view:
 
-    # KPIs
     st.markdown('<div class="sec"><h2>📌 Ringkasan Eksekutif</h2>'
                 '<p>Gabungan semua wilayah dan bidang</p></div>', unsafe_allow_html=True)
 
@@ -748,7 +809,6 @@ if "Overview" in view:
 
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
 
-    # Pie per Wilayah
     st.markdown('<div class="sec"><h2>🗺️ ICT vs Non-ICT per Wilayah</h2>'
                 '<p>Klik "Per Wilayah" di sidebar untuk detail Top 20</p></div>', unsafe_allow_html=True)
     cols = st.columns(3)
@@ -757,7 +817,6 @@ if "Overview" in view:
         dw = dpf[dpf["Segmen"]==w]
         with cols[i%3]:
             rv = dw["Total_Dealing_Rp"].sum()
-            # Count instansi/satker from detail
             dw_det = ddf[ddf["Segmen"]==w]
             ni = dw_det["Instansi_Pembeli"].nunique() if len(dw_det)>0 else 0
             ns = dw_det["Satuan_Kerja"].nunique() if len(dw_det)>0 else 0
@@ -772,7 +831,6 @@ if "Overview" in view:
 
     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
-    # Pie per Bidang
     st.markdown('<div class="sec-b"><h2>🏛️ ICT vs Non-ICT per Bidang K/L</h2>'
                 '<p>Klik "Per Bidang K/L" di sidebar untuk detail Top 20</p></div>', unsafe_allow_html=True)
     cols_b = st.columns(3)
@@ -796,7 +854,6 @@ if "Overview" in view:
 
     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
-    # Grand Top 20
     st.markdown('<div class="sec"><h2>🏆 Grand Top 20 SI Channel</h2>'
                 '<p>Semua segmen — dengan info instansi & satuan kerja yang dilayani</p></div>',
                 unsafe_allow_html=True)
@@ -814,13 +871,11 @@ if "Overview" in view:
 
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
-    # Grand SI Detail Cards — langsung tanpa outer expander (nested expander tidak diperbolehkan)
     st.markdown("**📋 Detail per SI — Instansi & Satuan Kerja**")
     render_si_cards(grand, ddf, "Semua Segmen", "gd")
 
     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
-    # Heatmaps
     st.markdown('<div class="sec"><h2>🔥 Heatmap: Top SI × Wilayah</h2></div>', unsafe_allow_html=True)
     dpw = dpf[dpf["Segmen"].isin(WILAYAH)]
     if len(dpw)>0:
