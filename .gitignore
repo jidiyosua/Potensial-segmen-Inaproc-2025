@@ -1,0 +1,43 @@
+# ═══════════════════════════════════════════════════════════════
+#  .gitignore — SI Potensial Prioritas INAPROC Dashboard
+# ═══════════════════════════════════════════════════════════════
+
+# ── Database files (terlalu besar untuk GitHub) ──
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual environment ──
+venv/
+env/
+.venv/
+.env/
+
+# ── Streamlit ──
+.streamlit/secrets.toml
+
+# ── IDE / Editor ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── OS ──
+desktop.ini
+ehthumbs.db
+
+# ── Logs ──
+*.log
