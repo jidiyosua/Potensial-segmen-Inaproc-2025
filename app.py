@@ -5,6 +5,8 @@
   Database: Datamart_Final_Report.db (SQLite)
   ───────────────────────────────────────────────────────────────────────
   streamlit run app.py
+  
+  OPTIMIZED v2 — Mega-regex, Parquet cache, Chart fuzzy uncensoring
 ═══════════════════════════════════════════════════════════════════════════
 """
 
@@ -17,6 +19,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import textwrap, os, io, hashlib, re, json, gdown
 from datetime import datetime
+from difflib import SequenceMatcher
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -126,6 +129,7 @@ section[data-testid="stSidebar"] .stRadio label span{color:#FFF!important;}
 # ═══════════════════════════════════════════════════════════════════════════
 DB_NAME = "Datamart_Final_Report.db"
 GDRIVE_FILE_ID = "1vo4oi_v8ePU6WAPeRmsUG_-bbTsjMmqD"
+PARQUET_CACHE = "datamart_cache.parquet"  # ← NEW: Parquet cache
 
 WILAYAH_MAP = {
     "Aceh":"Sumatera","Sumatera Utara":"Sumatera","Sumatera Barat":"Sumatera",
@@ -193,6 +197,9 @@ DINAS_PATTERNS = {
     "Dinas Perikanan":   r'(?i)(dinas\s*(perikanan|kelautan))',
 }
 
+# Pre-compile dinas patterns (avoid recompilation per call)
+DINAS_COMPILED = {k: re.compile(v) for k, v in DINAS_PATTERNS.items()}
+
 TEMA_KL = {
     "🌾 Ketahanan Pangan": {
         "kw_inst":[r"(?i)(kementerian\s*pertanian|kementan)",r"(?i)(kementerian\s*kelautan|kemen.?kkp)",
@@ -239,9 +246,17 @@ TEMA_KL = {
     },
 }
 
+# Pre-compile tema patterns
+for _t in TEMA_KL.values():
+    _t["_re_inst"] = [re.compile(p) for p in _t["kw_inst"]]
+    _t["_re_satker"] = [re.compile(p) for p in _t["kw_satker"]]
+
 # ═══════════════════════════════════════════════════════════════════════════
-# ICT CLASSIFICATION KEYWORDS
+# ICT CLASSIFICATION — MEGA-REGEX (COMPILED ONCE)
 # ═══════════════════════════════════════════════════════════════════════════
+# OLD: 50+ individual .str.contains() calls → ~100 passes over 4M rows
+# NEW: 1 compiled mega-regex → 2 passes total (whitelist + blacklist)
+
 ICT_WHITELIST = [
     r'\binternet\b',r'\bbandwidth\b',r'\bfiber\s*optik?\b',r'\bjaringan\b',
     r'\bwifi\b',r'\bwi-fi\b',r'\bhotspot\b',r'\bmpls\b',r'\bvpn\b',r'\bsd-wan\b',
@@ -272,6 +287,29 @@ ICT_BLACKLIST = [
     r'\brestorasi\b',r'\bperawat\s*taman\b',
     r'\bpemeliharaan\b(?!.*(server|jaringan|it|network))',
 ]
+
+# ★ MEGA-REGEX: Compile all patterns into ONE regex each
+# Patterns with negative lookahead can't be simply ORed, so we handle them specially
+_ICT_WL_SIMPLE = []
+_ICT_WL_LOOKAHEAD = []
+for p in ICT_WHITELIST:
+    if '(?!' in p:
+        _ICT_WL_LOOKAHEAD.append(re.compile(p, re.IGNORECASE))
+    else:
+        _ICT_WL_SIMPLE.append(p)
+
+_ICT_BL_SIMPLE = []
+_ICT_BL_LOOKAHEAD = []
+for p in ICT_BLACKLIST:
+    if '(?!' in p:
+        _ICT_BL_LOOKAHEAD.append(re.compile(p, re.IGNORECASE))
+    else:
+        _ICT_BL_SIMPLE.append(p)
+
+# Compile the simple patterns into mega-regex
+_ICT_WL_MEGA = re.compile('|'.join(_ICT_WL_SIMPLE), re.IGNORECASE) if _ICT_WL_SIMPLE else None
+_ICT_BL_MEGA = re.compile('|'.join(_ICT_BL_SIMPLE), re.IGNORECASE) if _ICT_BL_SIMPLE else None
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FORMAT HELPERS
@@ -331,6 +369,91 @@ def to_excel_styled(df, sheet_name="Data"):
     return buf.getvalue()
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ★ FUZZY UNCENSORING — pre-computed at load time
+# ═══════════════════════════════════════════════════════════════════════════
+def _build_clean_names_index(all_names):
+    """Build lookup structures from uncensored vendor names."""
+    clean = [n for n in all_names if '*' not in n and len(n) > 2]
+    index = {}
+    for n in clean:
+        key = (n[0].upper(), len(n))
+        index.setdefault(key, []).append(n)
+    return clean, index
+
+
+def _uncensor_name(censored, clean_index):
+    """Match a single censored name like 'P* W******' to best uncensored name."""
+    try:
+        pat_str = ""
+        for ch in censored:
+            if ch == '*':
+                pat_str += '.'
+            elif ch in r'\.[](){}+?^$|':
+                pat_str += '\\' + ch
+            else:
+                pat_str += ch
+        pat_re = re.compile(f'^{pat_str}$', re.IGNORECASE)
+        first_char = censored[0].upper() if censored[0] != '*' else None
+        candidates = []
+        if first_char:
+            bucket = clean_index.get((first_char, len(censored)), [])
+            candidates = [n for n in bucket if pat_re.match(n)]
+        if not candidates and first_char:
+            for delta in [-1, 1]:
+                bucket = clean_index.get((first_char, len(censored) + delta), [])
+                candidates.extend(n for n in bucket if pat_re.match(n))
+        if candidates:
+            return candidates[0]
+    except re.error:
+        pass
+    first_char = censored[0].upper() if censored[0] != '*' else None
+    best_score, best_match = 0.0, None
+    if first_char:
+        for delta in range(-2, 3):
+            bucket = clean_index.get((first_char, len(censored) + delta), [])
+            for cn in bucket:
+                score = SequenceMatcher(None, censored.upper(), cn.upper()).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_match = cn
+    if best_score >= 0.6:
+        return best_match
+    return censored
+
+
+def _build_uncensor_mapping(all_names):
+    """Pre-compute a dict mapping censored→uncensored for ALL starred names.
+    Called once at load time. Names without '*' are skipped."""
+    censored_names = [n for n in all_names if '*' in n]
+    if not censored_names:
+        return {}
+    _, clean_index = _build_clean_names_index(all_names)
+    mapping = {}
+    for cn in censored_names:
+        result = _uncensor_name(cn, clean_index)
+        if result != cn:
+            mapping[cn] = result
+    return mapping
+
+
+def uncensor_for_chart(agg_df, uncensor_map, name_col="Nama_Pemenang"):
+    """Uncensor starred names using pre-computed dict lookup.
+    Names without '*' are untouched."""
+    if len(agg_df) == 0 or not uncensor_map:
+        return agg_df
+    mask = agg_df[name_col].str.contains(r'\*', na=False)
+    if not mask.any():
+        return agg_df
+    result = agg_df.copy()
+    for idx in result[mask].index:
+        old_name = result.at[idx, name_col]
+        new_name = uncensor_map.get(old_name, old_name)
+        if new_name != old_name:
+            result.at[idx, name_col] = new_name
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # DATA LOADING & PREPROCESSING
 # ═══════════════════════════════════════════════════════════════════════════
 def _find_db():
@@ -338,7 +461,6 @@ def _find_db():
     db_path = os.path.join(sd, DB_NAME)
     if os.path.exists(db_path):
         return db_path
-    # Auto-download dari Google Drive jika belum ada
     try:
         url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
         gdown.download(url, db_path, quiet=False)
@@ -348,22 +470,9 @@ def _find_db():
         st.error(f"❌ Gagal download database dari Google Drive: {e}")
     return None
 
-def _classify_ict(nama_paket, kategori_paket):
-    text = f"{str(nama_paket)} {str(kategori_paket)}".lower()
-    for pat in ICT_BLACKLIST:
-        if re.search(pat, text): return "Non-ICT"
-    for pat in ICT_WHITELIST:
-        if re.search(pat, text): return "ICT"
-    return "Non-ICT"
-
-def _extract_provinsi(lokasi):
-    if pd.isna(lokasi): return "Lainnya"
-    return str(lokasi).split(",")[0].strip()
-
 VENDOR_MAPPING_FILE = "vendor_mapping.json"
 
 def _load_vendor_mapping():
-    """Load pre-computed fuzzy matching from JSON file."""
     sd = os.path.dirname(os.path.abspath(__file__))
     for base in [sd, ".", os.getcwd()]:
         p = os.path.join(base, VENDOR_MAPPING_FILE)
@@ -372,43 +481,67 @@ def _load_vendor_mapping():
                 return json.load(f)
     return {}
 
-def _vectorized_ict(nama_paket_series):
-    """Vectorized ICT classification — 50x faster than row-by-row."""
+
+def _vectorized_ict_fast(nama_paket_series):
+    """★ OPTIMIZED: Mega-regex ICT classification.
+    OLD: ~100 .str.contains() calls (50 whitelist + 17 blacklist patterns)
+    NEW: 2 mega-regex calls + a few lookahead patterns = ~50x faster
+    """
     text = nama_paket_series.fillna("").str.lower()
+    result = pd.Series("Non-ICT", index=text.index, dtype="object")
 
-    # Start with all Non-ICT
-    result = pd.Series("Non-ICT", index=text.index)
-
-    # Step 1: Blacklist — force Non-ICT (already default, but mark to skip whitelist)
+    # ── Blacklist: mega-regex (1 call) + lookahead patterns ──
     blacklist_mask = pd.Series(False, index=text.index)
-    for pat in ICT_BLACKLIST:
-        blacklist_mask |= text.str.contains(pat, na=False, regex=True)
+    if _ICT_BL_MEGA:
+        blacklist_mask |= text.str.contains(_ICT_BL_MEGA, na=False)
+    for pat in _ICT_BL_LOOKAHEAD:
+        blacklist_mask |= text.str.contains(pat, na=False)
 
-    # Step 2: Whitelist — mark as ICT (only where NOT blacklisted)
+    # ── Whitelist: mega-regex (1 call) + lookahead patterns ──
     ict_mask = pd.Series(False, index=text.index)
-    for pat in ICT_WHITELIST:
-        ict_mask |= text.str.contains(pat, na=False, regex=True)
+    if _ICT_WL_MEGA:
+        ict_mask |= text.str.contains(_ICT_WL_MEGA, na=False)
+    for pat in _ICT_WL_LOOKAHEAD:
+        ict_mask |= text.str.contains(pat, na=False)
 
     result[ict_mask & ~blacklist_mask] = "ICT"
     return result
 
 
+def _get_parquet_path():
+    sd = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(sd, PARQUET_CACHE)
+
+
 @st.cache_data(show_spinner="🔄 Memuat database…")
 def load_and_process():
+    parquet_path = _get_parquet_path()
+
+    # ═══ FAST PATH: Load from Parquet cache ═══
+    if os.path.exists(parquet_path):
+        try:
+            df = pd.read_parquet(parquet_path)
+            if all(c in df.columns for c in ["Nama_Pemenang","Pagu_Rp","Sektor","Wilayah","Provinsi","is_pemda"]):
+                total_rows = len(df)
+                n_matched = 0
+                # ★ Pre-compute uncensor mapping (uses cached index)
+                uncensor_map = _build_uncensor_mapping(df["Nama_Pemenang"].unique())
+                return df, total_rows, n_matched, None, uncensor_map
+        except Exception:
+            pass
+
+    # ═══ SLOW PATH: Load from SQLite → process → save Parquet ═══
     db_path = _find_db()
     if not db_path:
-        return None, 0, 0, f"Database {DB_NAME} tidak ditemukan."
+        return None, 0, 0, f"Database {DB_NAME} tidak ditemukan.", {}
 
     conn = sqlite3.connect(db_path)
-
-    # ── Step 1: Get table name ──
     tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", conn)
     if len(tables) == 0:
         conn.close()
-        return None, 0, 0, "Database kosong."
+        return None, 0, 0, "Database kosong.", {}
     tbl = tables['name'].iloc[0]
 
-    # ── Step 2: Discover ACTUAL columns ──
     pragma = conn.execute(f'PRAGMA table_info([{tbl}])').fetchall()
     db_columns = [row[1] for row in pragma]
 
@@ -421,58 +554,68 @@ def load_and_process():
     if missing_essential:
         conn.close()
         return None, 0, 0, (f"Kolom essential tidak ditemukan: {missing_essential}\n"
-                            f"Kolom di DB: {db_columns}")
+                            f"Kolom di DB: {db_columns}"), {}
 
-    # ── Step 3: SQL-level filtering (much faster than pandas filter) ──
     select_cols = []
     for c in ESSENTIAL + OPTIONAL:
         if c in db_columns and c not in select_cols:
             select_cols.append(c)
 
     cols_sql = ", ".join([f'[{c}]' for c in select_cols])
-
-    # Filter at SQL level: skip NULL/empty pemenang and zero pagu
-    # This can cut millions of rows BEFORE loading into memory
     pagu_cast = "CAST([Pagu_Rp] AS REAL)" if "Pagu_Rp" in db_columns else "0"
     sql = (f"SELECT {cols_sql} FROM [{tbl}] "
            f"WHERE [Nama_Pemenang] IS NOT NULL AND TRIM([Nama_Pemenang]) != '' "
            f"AND {pagu_cast} > 0")
 
-    # Get total count first (for display)
     total_rows = pd.read_sql(f"SELECT COUNT(*) as n FROM [{tbl}]", conn).iloc[0, 0]
-
     df = pd.read_sql(sql, conn)
     conn.close()
 
-    # Fill missing optional columns
     for c in ESSENTIAL + OPTIONAL:
         if c not in df.columns:
             df[c] = ""
 
-    # ── Step 4: Convert numeric ──
     df["Pagu_Rp"] = pd.to_numeric(df["Pagu_Rp"], errors="coerce").fillna(0)
     df["Total_Pelaksanaan_Rp"] = pd.to_numeric(df.get("Total_Pelaksanaan_Rp", 0), errors="coerce").fillna(0)
-
-    # Safety filter (in case SQL cast missed some)
     df = df[df["Pagu_Rp"] > 0].reset_index(drop=True)
 
-    # ── Step 5: Vendor name mapping (optional — from vendor_mapping.json) ──
+    # Vendor mapping
     n_matched = 0
-    mapping = _load_vendor_mapping()  # returns {} if file not found
+    mapping = _load_vendor_mapping()
     if mapping:
         mask = df["Nama_Pemenang"].isin(mapping.keys())
         n_matched = mask.sum()
         if n_matched > 0:
             df.loc[mask, "Nama_Pemenang"] = df.loc[mask, "Nama_Pemenang"].map(mapping)
 
-    # ── Step 6: ICT Classification (vectorized — fast!) ──
-    df["Sektor"] = _vectorized_ict(df["Nama_Paket"])
+    # ★ ICT Classification — MEGA-REGEX
+    df["Sektor"] = _vectorized_ict_fast(df["Nama_Paket"])
 
-    # ── Step 7: Wilayah (vectorized) ──
+    # Wilayah
     df["Provinsi"] = df["Lokasi"].str.split(",").str[0].str.strip().fillna("Lainnya")
     df["Wilayah"] = df["Provinsi"].map(WILAYAH_MAP).fillna("Lainnya")
 
-    return df, total_rows, n_matched, None
+    # ★ Pre-compute is_pemda column (vectorized, avoids .apply() later)
+    inst = df["Instansi_Pembeli"].fillna("").str.strip()
+    df["is_pemda"] = (inst.str.startswith("Kab.") |
+                      inst.str.startswith("Kota ") |
+                      inst.str.startswith("Provinsi "))
+
+    # ★ Convert object columns to category for memory savings
+    for col in ["Sektor", "Wilayah", "Provinsi", "Metode_Pemilihan", "Jenis_Pengadaan"]:
+        if col in df.columns:
+            df[col] = df[col].astype("category")
+
+    # ★ Pre-compute uncensor mapping (one-time fuzzy match)
+    uncensor_map = _build_uncensor_mapping(df["Nama_Pemenang"].unique())
+
+    # ★ Save Parquet cache for next reload (<1 sec load)
+    try:
+        df.to_parquet(parquet_path, index=False, compression="snappy")
+    except Exception:
+        pass
+
+    return df, total_rows, n_matched, None, uncensor_map
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -623,7 +766,6 @@ def agg_top_pemenang(df, sektor=None, n=20):
 
 
 def agg_top_instansi(df, n=15):
-    """Aggregate top N instansi by total Pagu_Rp."""
     if len(df) == 0: return pd.DataFrame()
     agg = (df.groupby("Instansi_Pembeli")
            .agg(Total_Pagu=("Pagu_Rp", "sum"),
@@ -636,35 +778,23 @@ def agg_top_instansi(df, n=15):
     return agg
 
 
-def _is_pemda(instansi):
-    """Check if instansi is Pemda (Kab./Kota/Provinsi)."""
-    if pd.isna(instansi): return False
-    s = str(instansi).strip()
-    return (s.startswith("Kab.") or s.startswith("Kota ") or s.startswith("Provinsi "))
-
-
 def filter_by_tema(df, tema_cfg):
-    """Filter by K/L tema keywords — EXCLUDE Pemda (Kab/Kota/Provinsi)."""
+    """Filter by K/L tema keywords — uses pre-compiled patterns + vectorized is_pemda."""
     mask = pd.Series(False, index=df.index)
-    for pat in tema_cfg["kw_inst"]:
+    for pat in tema_cfg["_re_inst"]:
         mask |= df["Instansi_Pembeli"].str.contains(pat, na=False)
-    for pat in tema_cfg["kw_satker"]:
+    for pat in tema_cfg["_re_satker"]:
         mask |= df["Satuan_Kerja"].str.contains(pat, na=False)
-    # Exclude Pemda — K/L view hanya untuk Kementerian/Lembaga
-    pemda_mask = df["Instansi_Pembeli"].apply(_is_pemda)
-    return df[mask & ~pemda_mask]
+    return df[mask & ~df["is_pemda"]]
 
 
 def filter_pemda_wilayah(df, wilayah):
-    """Filter Pemda (Kab/Kota/Provinsi) in a specific wilayah."""
-    pemda_mask = df["Instansi_Pembeli"].apply(_is_pemda)
-    wil_mask = df["Wilayah"] == wilayah
-    return df[pemda_mask & wil_mask]
+    return df[df["is_pemda"] & (df["Wilayah"] == wilayah)]
 
 
 def filter_by_dinas(df, dinas_name):
-    """Filter by dinas pattern in Satuan_Kerja."""
-    pat = DINAS_PATTERNS.get(dinas_name)
+    """Filter by dinas — uses pre-compiled patterns."""
+    pat = DINAS_COMPILED.get(dinas_name)
     if not pat: return pd.DataFrame()
     return df[df["Satuan_Kerja"].str.contains(pat, na=False)]
 
@@ -672,9 +802,10 @@ def filter_by_dinas(df, dinas_name):
 # ═══════════════════════════════════════════════════════════════════════════
 # RENDER HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
-def render_top20_section(df_section, section_name, color, key_prefix, semesta=None):
-    """Render Top 20 ICT + Non-ICT + detail cards for a section."""
-    # Make key_prefix safe and unique
+def render_top20_section(df_section, section_name, color, key_prefix, semesta=None,
+                         uncensor_map=None):
+    """Render Top 20 ICT + Non-ICT + detail cards for a section.
+    uncensor_map: dict mapping censored→uncensored names."""
     kp = re.sub(r'[^a-zA-Z0-9]', '', key_prefix)[:20]
 
     total_pagu = df_section["Pagu_Rp"].sum()
@@ -686,7 +817,6 @@ def render_top20_section(df_section, section_name, color, key_prefix, semesta=No
     ict_df = df_section[df_section["Sektor"]=="ICT"]
     non_df = df_section[df_section["Sektor"]=="Non-ICT"]
 
-    # KPIs
     c1,c2,c3,c4,c5 = st.columns(5)
     c1.markdown(kpi("Total Paket", fmt_n(n_paket)), unsafe_allow_html=True)
     c2.markdown(kpi("Total Pagu", fmt_rp(total_pagu)), unsafe_allow_html=True)
@@ -696,13 +826,15 @@ def render_top20_section(df_section, section_name, color, key_prefix, semesta=No
 
     st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
-    # Tabs
     t_ict, t_non, t_inst, t_detail = st.tabs(
         ["💻 Top 20 ICT", "📦 Top 20 Non-ICT", "🏛️ Top Instansi", "📋 Detail Paket"])
 
     with t_ict:
         agg_ict = agg_top_pemenang(df_section, "ICT")
         if len(agg_ict) > 0:
+            # ★ Fuzzy uncensor for chart display (dict lookup)
+            if uncensor_map:
+                agg_ict = uncensor_for_chart(agg_ict, uncensor_map)
             sem_ict = ict_df["Pagu_Rp"].sum()
             fig = chart_top20(agg_ict,
                               f"Top {min(20,len(agg_ict))} Pemenang ICT — {section_name}",
@@ -721,6 +853,9 @@ def render_top20_section(df_section, section_name, color, key_prefix, semesta=No
     with t_non:
         agg_non = agg_top_pemenang(df_section, "Non-ICT")
         if len(agg_non) > 0:
+            # ★ Fuzzy uncensor for chart display (dict lookup)
+            if uncensor_map:
+                agg_non = uncensor_for_chart(agg_non, uncensor_map)
             sem_non = non_df["Pagu_Rp"].sum()
             fig = chart_top20(agg_non,
                               f"Top {min(20,len(agg_non))} Pemenang Non-ICT — {section_name}",
@@ -766,7 +901,6 @@ def render_top20_section(df_section, section_name, color, key_prefix, semesta=No
 
 
 def _render_pemenang_expanders(agg_df, detail_df, key_prefix):
-    """Render expandable cards for top pemenang."""
     for idx, (_, row) in enumerate(agg_df.head(20).iterrows()):
         si = row["Nama_Pemenang"]
         dsi = detail_df[detail_df["Nama_Pemenang"] == si]
@@ -810,7 +944,6 @@ def _render_pemenang_expanders(agg_df, detail_df, key_prefix):
 
 
 def render_drilldown_table(df_sub, label, key_prefix):
-    """Render full detail table + CSV download for a drill-down selection."""
     kp = re.sub(r'[^a-zA-Z0-9]', '', key_prefix)[:25]
     cols_show = ["Nama_Pemenang","Pagu_Rp","Instansi_Pembeli","Satuan_Kerja",
                  "Lokasi","Metode_Pemilihan","Sektor","Nama_Paket"]
@@ -840,14 +973,12 @@ def render_drilldown_table(df_sub, label, key_prefix):
     df_disp["Pagu_Rp"] = df_disp["Pagu_Rp"].apply(fmt_rp)
     st.dataframe(df_disp, use_container_width=True, hide_index=True, height=350)
 
-    # CSV download
     csv_data = df_raw.head(5000).to_csv(index=False).encode("utf-8")
     st.download_button(f"📥 Download CSV — {label}",
                        csv_data,
                        f"{kp}_{datetime.now():%Y%m%d}.csv",
                        "text/csv",
                        key=f"dlcsv_{kp}")
-    # Excel download
     st.download_button(f"📥 Download Excel — {label}",
                        to_excel_styled(df_raw.head(5000), label[:25]),
                        f"{kp}_{datetime.now():%Y%m%d}.xlsx",
@@ -864,7 +995,7 @@ st.markdown("""
     <p>Data Realisasi KLPD &nbsp;|&nbsp; Telkomsel Enterprise — Bid Management Intelligence</p>
 </div>""", unsafe_allow_html=True)
 
-df, total_rows, n_matched, err = load_and_process()
+df, total_rows, n_matched, err, UNCENSOR_MAP = load_and_process()
 if err:
     st.error(f"⚠️ {err}\n\nLetakkan `{DB_NAME}` di folder yang sama dengan `app.py`.")
     st.stop()
@@ -880,7 +1011,14 @@ with st.sidebar:
                 unsafe_allow_html=True)
     st.markdown("---")
     st.success(f"✅ {fmt_n(len(df))} paket loaded (dari {fmt_n(total_rows)})")
-    st.info(f"🔓 {fmt_n(n_matched)} nama di-uncensor")
+    st.info(f"🔓 {fmt_n(n_matched)} vendor-mapping | {fmt_n(len(UNCENSOR_MAP))} chart-uncensor")
+
+    # ★ Show parquet cache status
+    pq = _get_parquet_path()
+    if os.path.exists(pq):
+        pq_mb = os.path.getsize(pq) / 1e6
+        st.caption(f"⚡ Cache aktif ({pq_mb:.0f} MB)")
+    
     st.markdown("---")
     view = st.radio("📌 Tampilan",
                     ["🏠 Overview",
@@ -890,15 +1028,24 @@ with st.sidebar:
     st.markdown("---")
     sektor_filter = st.radio("🔍 Sektor", ["Semua","ICT","Non-ICT"], index=0)
     st.markdown("---")
+
+    # ★ Cache management
+    if os.path.exists(pq):
+        if st.button("🗑️ Hapus Cache", use_container_width=True, help="Rebuild dari SQLite"):
+            os.remove(pq)
+            st.cache_data.clear()
+            st.rerun()
+
     if st.button("🚪 Logout", use_container_width=True):
         st.session_state["authenticated"] = False
         st.rerun()
     st.caption(f"Telkomsel Enterprise\n{datetime.now():%d %B %Y}")
 
-# Apply sektor filter
-dff = df.copy()
+# Apply sektor filter (no full .copy() — use view when possible)
 if sektor_filter != "Semua":
-    dff = dff[dff["Sektor"] == sektor_filter]
+    dff = df[df["Sektor"] == sektor_filter]
+else:
+    dff = df
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -934,6 +1081,8 @@ if "Overview" in view:
                 unsafe_allow_html=True)
     grand = agg_top_pemenang(dff)
     if len(grand) > 0:
+        # ★ Fuzzy uncensor for chart (dict lookup)
+        grand = uncensor_for_chart(grand, UNCENSOR_MAP)
         fig = chart_top20(grand, "Grand Top 20 Pemenang — Semua Segmen",
                           f"{fmt_n(n_pemenang)} pemenang unik • {fmt_n(n_inst)} instansi • {fmt_n(n_satker)} satker",
                           "#ED1C24", total_pagu)
@@ -974,7 +1123,6 @@ if "Overview" in view:
     st.markdown('<div class="sec"><h2>🔥 Heatmap: Top Pemenang × Wilayah</h2></div>', unsafe_allow_html=True)
     df_wil = dff[dff["Wilayah"].isin(WILAYAH_LIST)]
     if len(df_wil) > 0:
-        # Aggregate for heatmap
         hm_agg = df_wil.groupby(["Nama_Pemenang","Wilayah"])["Pagu_Rp"].sum().reset_index()
         fig = chart_heatmap(hm_agg, "Nama_Pemenang", "Wilayah", "Pagu_Rp",
                             "Top 15 Pemenang × Wilayah — Nilai Pagu", "Reds")
@@ -1010,9 +1158,9 @@ elif "K/L" in view:
 
             tema_kp = re.sub(r'[^a-zA-Z0-9]', '', tema_name)[:10]
             render_top20_section(df_tema, tema_name, cfg["color"], f"kl{tema_kp}",
-                                semesta=dff["Pagu_Rp"].sum())
+                                semesta=dff["Pagu_Rp"].sum(),
+                                uncensor_map=UNCENSOR_MAP)
 
-            # Drill-down per Instansi
             st.markdown(f"<div style='height:16px'></div>", unsafe_allow_html=True)
             st.markdown(f"**🔎 Drill-down per Instansi Pembeli — {tema_name}**")
             inst_list = df_tema["Instansi_Pembeli"].value_counts().head(20).index.tolist()
@@ -1038,7 +1186,11 @@ elif "Wilayah" in view:
                         horizontal=True, key="wil_subview")
 
     if sub_view == "📍 Per Wilayah":
-        wdata = [w for w in WILAYAH_LIST if len(filter_pemda_wilayah(dff, w)) > 0]
+        # ★ Pre-compute pemda data per wilayah (avoid repeated filtering)
+        pemda_by_wil = {w: filter_pemda_wilayah(dff, w) for w in WILAYAH_LIST}
+        wdata = [w for w in WILAYAH_LIST if len(pemda_by_wil[w]) > 0]
+        # ★ Compute semesta once outside the loop
+        sem_all = sum(pemda_by_wil[w]["Pagu_Rp"].sum() for w in WILAYAH_LIST)
         if not wdata:
             st.warning("Tidak ada data Pemda.")
         else:
@@ -1046,7 +1198,7 @@ elif "Wilayah" in view:
             for tab, w in zip(tabs, wdata):
                 with tab:
                     cf = W_CFG[w]
-                    dw = filter_pemda_wilayah(dff, w)
+                    dw = pemda_by_wil[w]
                     w_kp = re.sub(r'[^a-zA-Z0-9]', '', w)[:8]
                     st.markdown(f"""
                     <div class="rcard" style="background:{cf['bg']};border-color:{cf['c']}">
@@ -1054,10 +1206,9 @@ elif "Wilayah" in view:
                         <p>{fmt_n(len(dw))} paket | {fmt_rp(dw['Pagu_Rp'].sum())} |
                         {fmt_n(dw['Nama_Pemenang'].nunique())} pemenang | {fmt_n(dw['Instansi_Pembeli'].nunique())} instansi Pemda</p>
                     </div>""", unsafe_allow_html=True)
-                    sem_all = sum(filter_pemda_wilayah(dff, ww)["Pagu_Rp"].sum() for ww in WILAYAH_LIST)
-                    render_top20_section(dw, f"Wilayah {w}", cf["c"], f"wil{w_kp}", semesta=sem_all)
+                    render_top20_section(dw, f"Wilayah {w}", cf["c"], f"wil{w_kp}", semesta=sem_all,
+                                        uncensor_map=UNCENSOR_MAP)
 
-                    # Drill-down per Instansi Pemda
                     st.markdown(f"**🔎 Drill-down per Instansi Pembeli — {w}:**")
                     inst_list = dw["Instansi_Pembeli"].value_counts().head(25).index.tolist()
                     if inst_list:
@@ -1073,9 +1224,8 @@ elif "Wilayah" in view:
                     '<p>Satuan kerja Diskominfo/Komunikasi — hanya Pemda (Kab/Kota/Provinsi)</p></div>',
                     unsafe_allow_html=True)
 
-        # Filter: Diskominfo satker + Pemda instansi only
         df_dkom = filter_by_dinas(dff, "Diskominfo")
-        df_dkom = df_dkom[df_dkom["Instansi_Pembeli"].apply(_is_pemda)]
+        df_dkom = df_dkom[df_dkom["is_pemda"]]
 
         if len(df_dkom) == 0:
             st.warning("Tidak ada data DISKOMINFO Pemda.")
@@ -1087,9 +1237,9 @@ elif "Wilayah" in view:
             c4.markdown(kpi("Pemenang", fmt_n(df_dkom["Nama_Pemenang"].nunique())), unsafe_allow_html=True)
 
             render_top20_section(df_dkom, "DISKOMINFO se-Indonesia", "#7B1FA2", "dkom",
-                                semesta=dff["Pagu_Rp"].sum())
+                                semesta=dff["Pagu_Rp"].sum(),
+                                uncensor_map=UNCENSOR_MAP)
 
-            # Drill down per instansi
             st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
             st.markdown("**🔎 Drill-down per Instansi Pembeli (Diskominfo):**")
             dkom_inst = df_dkom["Instansi_Pembeli"].value_counts().head(30)
@@ -1133,9 +1283,9 @@ elif "Wilayah" in view:
                     </div>""", unsafe_allow_html=True)
 
                     render_top20_section(df_dinas, f"{dinas_name} {sel_w}", cf["c"],
-                                        unique_kp, semesta=dw["Pagu_Rp"].sum())
+                                        unique_kp, semesta=dw["Pagu_Rp"].sum(),
+                                        uncensor_map=UNCENSOR_MAP)
 
-                    # Drill-down per instansi
                     st.markdown(f"**🔎 Per Instansi Pembeli ({dinas_name} — {sel_w}):**")
                     inst_list = df_dinas["Instansi_Pembeli"].value_counts().head(20).index.tolist()
                     if inst_list:
@@ -1179,16 +1329,16 @@ elif "Detail" in view:
                 f"{fmt_n(df_exp['Nama_Pemenang'].nunique())} pemenang unik")
 
     if len(df_exp) > 0:
-        # Summary
         agg_exp = agg_top_pemenang(df_exp, n=20)
         if len(agg_exp) > 0:
+            # ★ Fuzzy uncensor (dict lookup)
+            agg_exp = uncensor_for_chart(agg_exp, UNCENSOR_MAP)
             fig = chart_top20(agg_exp,
                               f"Top 20 Pemenang — Hasil Filter",
                               f"N={fmt_n(len(df_exp))} paket | Total: {fmt_rp(df_exp['Pagu_Rp'].sum())}",
                               "#ED1C24", df_exp["Pagu_Rp"].sum())
             st.pyplot(fig, use_container_width=True); plt.close(fig)
 
-        # Raw data table
         st.markdown("**📊 Data Mentah (max 1.000 baris):**")
         cols_show = ["Nama_Pemenang","Pagu_Rp","Instansi_Pembeli","Satuan_Kerja",
                      "Lokasi","Wilayah","Sektor","Metode_Pemilihan","Jenis_Pengadaan","Nama_Paket"]
@@ -1216,6 +1366,6 @@ st.markdown(f"""
 <div style="text-align:center;padding:24px 0;color:#BBB!important;font-size:11px;">
     Dashboard Realisasi Pengadaan Pemerintah — INAPROC<br>
     Telkomsel Enterprise | Bid Management — Data Science | {datetime.now():%Y}<br>
-    <span style="font-size:10px;">🔓 {fmt_n(n_matched)} nama vendor tersensor telah di-uncensor via fuzzy matching<br>
+    <span style="font-size:10px;">🔓 {fmt_n(n_matched)} vendor-mapping | {fmt_n(len(UNCENSOR_MAP))} chart fuzzy-uncensor<br>
     📊 {fmt_n(len(df))} paket dari {fmt_n(total_rows)} total records | Database: {DB_NAME}</span>
 </div>""", unsafe_allow_html=True)
