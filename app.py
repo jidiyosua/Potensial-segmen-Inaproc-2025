@@ -209,8 +209,11 @@ section[data-testid="stSidebar"] .stRadio label span{color:#FFF!important;}
 .sep-thick{border:none;border-top:3px solid #ED1C24;margin:32px 0;opacity:0.3;}
 
 /* ── Footer ── */
+/* ── Footer — override global .stApp color ── */
 .footer-box{background:#1A1A2E;border-radius:16px;padding:24px;text-align:center;margin-top:32px;}
-.footer-box *{color:#9CA3AF!important;}
+.stApp .footer-box p,.stApp .footer-box span,.stApp .footer-box div{color:#FFFFFF!important;}
+.stApp .footer-box .ft-sub{color:#D1D5DB!important;}
+.stApp .footer-box .ft-dim{color:#9CA3AF!important;}
 
 #MainMenu{visibility:hidden;} footer{visibility:hidden;}
 </style>""", unsafe_allow_html=True)
@@ -537,7 +540,7 @@ def uncensor_for_chart(agg_df, uncensor_map, name_col="Nama_Display"):
 # ★ TURSO CONNECTION — libsql (primary) → HTTP chunked (fallback)
 # ═══════════════════════════════════════════════════════════════════════════
 TURSO_URL = "libsql://datamart-jidiyosua.aws-eu-west-1.turso.io"
-TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3NzUwMjMyOTMsImlkIjoiMDE5ZDQ3MWMtM2EwMS03N2FiLTk1ZGItM2QzMzJjNzkxZDViIiwicmlkIjoiZmY0NjljZDMtY2ZlMy00YjUzLWI1NjMtYWY5NmVhZTJiOTg2In0.smf3CuGes3WLws8Dz3KbQu3CJQijntU8NdVcBOIVdpYEXgIHO6D1SZoX24ozbHLsxltQdI46TC-IZbCQ0WRdBQ"
+TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJ1VVFJSUN6aEVmR1NKNWJaSVBGSkZ3In0.a1ZPmbTHxRsFfh0MoNHdR6_jL20YZI72uWP_n02oOkTNVsuPeaj6VO8br57QD2IusVvT6CL2QBXKk9s-KsU3AQ"
 try:
     TURSO_URL = st.secrets["turso"]["url"]
     TURSO_TOKEN = st.secrets["turso"]["token"]
@@ -1385,11 +1388,11 @@ elif "Pencarian" in view:
 # ═══════════════════════════════════════════════════════════════════════════
 st.markdown(f"""
 <div class="footer-box">
-    <p style="font-size:14px;font-weight:700;color:#FFFFFF!important;margin:0 0 8px">
+    <p style="font-size:14px;font-weight:700;margin:0 0 8px">
         Dashboard Realisasi Pengadaan Pemerintah — INAPROC 2025</p>
-    <p style="font-size:12px;color:#D1D5DB!important;margin:0 0 6px">
+    <p class="ft-sub" style="font-size:12px;margin:0 0 6px">
         Telkomsel Enterprise &nbsp;|&nbsp; EBPM — EPES — Direktorat PnT &nbsp;|&nbsp; Bid Management Data Science</p>
-    <p style="font-size:11px;color:#9CA3AF!important;margin:0">
+    <p class="ft-dim" style="font-size:11px;margin:0">
         📊 {fmt_n(len(df))} paket dari {fmt_n(total_rows)} records &nbsp;|&nbsp; Sumber: {db_source}
         &nbsp;|&nbsp; Generated: {datetime.now():%d %B %Y %H:%M}</p>
 </div>""", unsafe_allow_html=True)
