@@ -6,3 +6,4 @@ matplotlib
 openpyxl
 gdown
 requests
+libsql-experimental

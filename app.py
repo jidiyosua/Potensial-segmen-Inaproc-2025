@@ -534,7 +534,7 @@ def uncensor_for_chart(agg_df, uncensor_map, name_col="Nama_Display"):
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ★ TURSO CONNECTION — HTTP API (just requests, no libsql needed)
+# ★ TURSO CONNECTION — libsql (primary) → HTTP chunked (fallback)
 # ═══════════════════════════════════════════════════════════════════════════
 TURSO_URL = "libsql://datamart-jidiyosua.aws-eu-west-1.turso.io"
 TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3NzUwMjMyOTMsImlkIjoiMDE5ZDQ3MWMtM2EwMS03N2FiLTk1ZGItM2QzMzJjNzkxZDViIiwicmlkIjoiZmY0NjljZDMtY2ZlMy00YjUzLWI1NjMtYWY5NmVhZTJiOTg2In0.smf3CuGes3WLws8Dz3KbQu3CJQijntU8NdVcBOIVdpYEXgIHO6D1SZoX24ozbHLsxltQdI46TC-IZbCQ0WRdBQ"
@@ -546,7 +546,6 @@ except:
 
 
 class _TursoResult:
-    """Mimics sqlite3 cursor result."""
     def __init__(self, rows):
         self._rows = rows
     def fetchall(self):
@@ -556,18 +555,19 @@ class _TursoResult:
 
 
 class TursoHTTP:
-    """Turso via HTTP API — drop-in for sqlite3.connect(). No Rust needed."""
+    """Turso via HTTP API — chunked fetch for large queries."""
+    CHUNK = 100_000
 
     def __init__(self, url, token):
         self._base = url.replace("libsql://", "https://").rstrip("/")
         self._token = token
 
-    def execute(self, sql):
+    def _post(self, sql, timeout=300):
         r = requests.post(
             f"{self._base}/v2/pipeline",
             headers={"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"},
             json={"requests": [{"type": "execute", "stmt": {"sql": sql}}, {"type": "close"}]},
-            timeout=120
+            timeout=timeout
         )
         if r.status_code != 200:
             raise Exception(f"Turso HTTP {r.status_code}: {r.text[:300]}")
@@ -575,8 +575,10 @@ class TursoHTTP:
         result = data.get("results", [{}])[0]
         if result.get("type") == "error":
             raise Exception(f"Turso SQL: {result.get('error', {}).get('message', '')}")
-        resp = result.get("response", {}).get("result", {})
-        raw_rows = resp.get("rows", [])
+        return result.get("response", {}).get("result", {})
+
+    @staticmethod
+    def _parse_rows(raw_rows):
         parsed = []
         for row in raw_rows:
             vals = []
@@ -585,16 +587,47 @@ class TursoHTTP:
                 elif isinstance(cell, dict): vals.append(cell.get("value"))
                 else: vals.append(cell)
             parsed.append(tuple(vals))
-        return _TursoResult(parsed)
+        return parsed
+
+    def execute(self, sql):
+        """Small queries (PRAGMA, COUNT, SELECT 1, etc)."""
+        resp = self._post(sql, timeout=60)
+        return _TursoResult(self._parse_rows(resp.get("rows", [])))
+
+    def execute_chunked(self, sql, total_hint=0):
+        """Large SELECT — fetch in 100K-row chunks to avoid timeout."""
+        all_rows = []
+        offset = 0
+        while True:
+            chunk_sql = f"{sql} LIMIT {self.CHUNK} OFFSET {offset}"
+            resp = self._post(chunk_sql, timeout=300)
+            rows = self._parse_rows(resp.get("rows", []))
+            all_rows.extend(rows)
+            if total_hint > 0:
+                pct = min(100, len(all_rows) / total_hint * 100)
+                st.toast(f"Loading: {len(all_rows):,}/{total_hint:,} ({pct:.0f}%)")
+            if len(rows) < self.CHUNK:
+                break
+            offset += self.CHUNK
+        return _TursoResult(all_rows)
 
 
 def _connect_db():
-    """Connect Turso (cloud) via HTTP atau local SQLite (fallback)."""
+    """Try: 1) libsql (Linux/Streamlit Cloud) 2) HTTP API 3) local SQLite."""
     if TURSO_URL and TURSO_TOKEN:
+        try:
+            import libsql_experimental as libsql
+            conn = libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
+            conn.execute("SELECT 1")
+            return conn, "Turso (libsql)"
+        except ImportError:
+            pass
+        except Exception:
+            pass
         try:
             conn = TursoHTTP(TURSO_URL, TURSO_TOKEN)
             conn.execute("SELECT 1")
-            return conn, "Turso Cloud"
+            return conn, "Turso (HTTP)"
         except Exception as e:
             st.warning(f"Turso unavailable: {e}")
     import sqlite3 as sq3
@@ -680,7 +713,12 @@ def load_and_process():
 
         sql = (f"SELECT {cols_sql} FROM [{tbl}] WHERE [Nama_Pemenang] IS NOT NULL AND TRIM([Nama_Pemenang]) != '' "
                f"AND CAST([Pagu_Rp] AS REAL) > 0")
-        rows = conn.execute(sql).fetchall()
+
+        # ★ Use chunked fetch for HTTP API (large data), normal for libsql/sqlite3
+        if isinstance(conn, TursoHTTP):
+            rows = conn.execute_chunked(sql, total_hint=total_rows).fetchall()
+        else:
+            rows = conn.execute(sql).fetchall()
         df = pd.DataFrame(rows, columns=select_cols)
     except Exception as e:
         return None, 0, 0, f"Error query database ({db_source}): {e}", db_source
