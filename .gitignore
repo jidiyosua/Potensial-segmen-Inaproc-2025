@@ -1,0 +1,15 @@
+﻿# Database SQLite — terlalu besar (2.5 GB), jangan push
+*.db
+*.db-shm
+*.db-wal
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Streamlit secrets — RAHASIA, jangan push!
+.streamlit/secrets.toml
+
+# Folder lain yang tidak perlu
+web-based/
